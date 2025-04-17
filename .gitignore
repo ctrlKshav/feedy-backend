@@ -1,3 +1,4 @@
 ﻿.venv3
+.newenv
 .env
 __pycache__

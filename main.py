@@ -139,7 +139,7 @@ async def refine_persona(request: RefinePersonaRequest):
 
 
         completion = client.chat.completions.create(
-            model="llama-3.2-90b-vision-preview",
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": combined_prompt},
@@ -236,7 +236,7 @@ async def analyze_images(request: AnalysisRequest):
             
         for image in request.image_urls:
             completion = client.chat.completions.create(
-                model="llama-3.2-11b-vision-preview",
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
                 messages=[
                     {
                         "role": "user",
