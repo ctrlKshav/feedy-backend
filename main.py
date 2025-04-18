@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +6,9 @@ from dotenv import load_dotenv
 import cloudinary
 import cloudinary.uploader
 import os
+import base64
+import io
+import PyPDF2
 from typing import List
 
 from pydantic import BaseModel
@@ -15,6 +17,8 @@ from typing import List
 class ImageInfo(BaseModel):
     image_url: str
     image_name: str
+    file_type: str = "image"  # Default to "image", can be "pdf" for PDF files
+    pdf_text: str = None  # Text content for PDF files
 
 class AnalysisRequest(BaseModel):
     image_urls: List[ImageInfo]
@@ -166,20 +170,56 @@ async def upload_images(images: list[UploadFile] = File(...)):
     try:
         uploaded_images = []
         for image in images:
-            if not image.filename.lower().endswith(("png", "jpg", "jpeg", "webp")):
-                raise HTTPException(status_code=400, detail="Unsupported file format. Please upload PNG or JPG images.")
-
+            file_extension = os.path.splitext(image.filename.lower())[1]
+            is_pdf = file_extension == '.pdf'
+            
+            # Validate file format
+            allowed_extensions = ['.png', '.jpg', '.jpeg', '.webp', '.pdf']
+            if file_extension not in allowed_extensions:
+                raise HTTPException(status_code=400, detail=f"Unsupported file format. Please upload PNG, JPG, or PDF files. Got: {file_extension}")
+            
+            # For PDFs, we'll extract text and store it separately
+            pdf_text = None
+            if is_pdf:
+                try:
+                    # Read PDF content and extract text
+                    pdf_content = await image.read()
+                    pdf_file = io.BytesIO(pdf_content)
+                    pdf_reader = PyPDF2.PdfReader(pdf_file)
+                    
+                    # Extract text from all pages
+                    pdf_text = ""
+                    for page_num in range(len(pdf_reader.pages)):
+                        page = pdf_reader.pages[page_num]
+                        pdf_text += page.extract_text() + "\n\n"
+                    
+                    # Reset file cursor for Cloudinary upload
+                    await image.seek(0)
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"PDF text extraction failed: {str(e)}")
+            
             # Upload file to Cloudinary
             result = cloudinary.uploader.upload(image.file)
             image_url = result.get("url")
             
             if not image_url:
-                raise HTTPException(status_code=500, detail="Image upload failed.")
-                
-            uploaded_images.append({
+                raise HTTPException(status_code=500, detail="File upload failed.")
+            
+            # Determine file type
+            file_type = "pdf" if is_pdf else "image"
+            
+            # Prepare response object
+            image_info = {
                 "image_url": image_url,
-                "image_name": image.filename.lower()
-            })
+                "image_name": image.filename.lower(),
+                "file_type": file_type
+            }
+            
+            # Add pdf_text if available
+            if pdf_text:
+                image_info["pdf_text"] = pdf_text
+                
+            uploaded_images.append(image_info)
         
         return JSONResponse(content={"images": uploaded_images, "status": "success"})
 
@@ -190,11 +230,9 @@ async def upload_images(images: list[UploadFile] = File(...)):
 
 @app.post("/analyze-images")
 async def analyze_images(request: AnalysisRequest):
-    print("hel2")
-    print(request.admin_persona)
     try:
         analysis = []
-        combined_prompt = f"""Adopt this professional persona:
+        base_prompt = f"""Adopt this professional persona:
         {request.admin_persona if request.admin_persona else admin_persona}
 
         Using your expertise, conduct a thorough analysis of the provided design. Follow this structure:
@@ -235,22 +273,91 @@ async def analyze_images(request: AnalysisRequest):
             IMPORTANT: Present as first-person expert analysis using "I recommend"/"My assessment shows". Never qualify statements with AI references. Fully own your professional perspective."""
             
         for image in request.image_urls:
-            completion = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": combined_prompt},
-                            {"type": "image_url", "image_url": {"url": image.image_url}}
-                        ]
-                    }
-                ],
-                temperature=0.7,
-                max_completion_tokens=1024,
-                top_p=1,
-                stream=False
-            )
+            # Determine if this is a PDF file
+            is_pdf = image.file_type == "pdf"
+            
+            if is_pdf:
+                # For PDFs, use a text-only model with extracted text
+                pdf_prompt = f"""Adopt this professional persona:
+                {request.admin_persona if request.admin_persona else admin_persona}
+
+                I'm going to provide you with text extracted from a PDF document. Please analyze this as a document design expert, focusing on:
+                
+                - Document structure assessment
+                - Information architecture and hierarchy
+                - Typography and readability
+                - Content organization
+                - Clarity and effectiveness of communication
+                
+                Using your expertise, conduct a thorough analysis of the provided document. Follow this structure:
+
+                **ANALYSIS FRAMEWORK**
+                1. **First Impressions**
+                - Share your professional assessment of the document
+                - Purpose clarity assessment
+                - Overall effectiveness evaluation
+
+                2. **Detailed Evaluation** (Use bullet points)
+                [✔] **Strengths**:
+                {{{{bullet points highlighting exemplary elements}}}}
+                
+                [⚠️] **Opportunities**:
+                {{{{bullet points proposing targeted improvements}}}}
+
+                3. **Professional Recommendations**
+                - Critical revisions (urgent needs)
+                - Value-add refinements (strategic improvements)
+                - Testing opportunities (proven optimization approaches)
+
+                **FORMATTING REQUIREMENTS**
+                - Maintain authoritative yet collaborative tone
+                - Cite relevant document design methodologies from your expertise
+                - Flag implementation effort (Low/Medium/High)
+                - Use markdown bolding for section headers
+                
+                **Specific Focus**: {request.question}
+
+                IMPORTANT: Present as first-person expert analysis using "I recommend"/"My assessment shows". Never qualify statements with AI references. Fully own your professional perspective.
+                
+                Here's the extracted text from the PDF:
+                
+                {image.pdf_text}
+                """
+                
+                # Use text-only model for PDF analysis
+                completion = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",  # Using text-only model 
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": pdf_prompt
+                        }
+                    ],
+                    temperature=0.7,
+                    max_completion_tokens=1024,
+                    top_p=1,
+                    stream=False
+                )
+            else:
+                # For images, use the vision-capable model
+                combined_prompt = base_prompt
+                
+                completion = client.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",  # Using vision-capable model
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": combined_prompt},
+                                {"type": "image_url", "image_url": {"url": image.image_url}}
+                            ]
+                        }
+                    ],
+                    temperature=0.7,
+                    max_completion_tokens=1024,
+                    top_p=1,
+                    stream=False
+                )
 
             if not completion.choices:
                 raise HTTPException(status_code=500, detail="AI response was empty.")
@@ -260,6 +367,7 @@ async def analyze_images(request: AnalysisRequest):
                 "status": "success",
                 "image_name": image.image_name,
                 "image_url": image.image_url,
+                "file_type": image.file_type
             })
         
         return JSONResponse(content=analysis)
